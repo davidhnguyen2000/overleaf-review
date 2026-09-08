@@ -9,7 +9,7 @@ page reloads on the new PDF. Then it waits for your next pass.
 
 ![The review viewer: a rendered page with three highlighted passages, and the sidebar holding a note against each one](docs/review.png)
 
-<sub>Example pass over “High Speed Robotic Table Tennis Swinging Using Lightweight Hardware with Model Predictive Control” (ICRA 2025).</sub>
+<sub>A pass over “Whole-Body Model Predictive Control for Spin-Aware Quadrupedal Table Tennis.”</sub>
 
 > **Requires the [Overleaf Connect][oc] VS Code extension.** It is what puts your
 > Overleaf project on local disk and compiles it locally. See
@@ -109,6 +109,8 @@ that halts it at the next checkpoint, leaving the edits it already made in
 place:
 
 ![The sidebar mid-pass, reading "Claude is working" with the current step and a Stop button](docs/working.png)
+
+<sub>A second paper mid-pass: “High Speed Robotic Table Tennis Swinging Using Lightweight Hardware with Model Predictive Control” (ICRA 2025).</sub>
 
 When the rebuild lands, the page reloads on the new PDF and Claude arms itself
 for another pass. **End session** shuts the server down.
