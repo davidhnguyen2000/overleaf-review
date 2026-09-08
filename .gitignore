@@ -1,0 +1,4 @@
+.pdf-review/
+__pycache__/
+*.pyc
+.DS_Store

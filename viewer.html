@@ -1,0 +1,481 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>PDF review</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  :root {
+    --bg: #f4f4f2; --panel: #fff; --ink: #1b1b1a; --muted: #6b6b66;
+    --line: #dedcd6; --mark: rgba(255, 213, 64, .42); --accent: #b4531f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#17171a; --panel:#202024; --ink:#e9e9e6; --muted:#9a9a94;
+            --line:#33333a; --mark:rgba(255,205,60,.30); --accent:#e2814a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; display:flex; background:var(--bg); color:var(--ink);
+         font:14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+
+  #doc { flex:1; overflow:auto; padding:24px 0 64px; }
+  .page { position:relative; margin:0 auto 18px; box-shadow:0 1px 5px rgba(0,0,0,.22); background:#fff; }
+  .page canvas { display:block; }
+  .textLayer { position:absolute; inset:0; overflow:hidden; opacity:1; line-height:1;
+               text-align:initial; text-size-adjust:none; forced-color-adjust:none;
+               transform-origin:0 0; }
+  .textLayer span, .textLayer br { position:absolute; white-space:pre; cursor:text;
+                    color:transparent; transform-origin:0% 0%; }
+  .textLayer .endOfContent { display:block; position:absolute; inset:100% 0 0;
+                    z-index:-1; cursor:default; user-select:none; }
+  .textLayer ::selection { background:rgba(120,170,255,.45); }
+  .marks { position:absolute; inset:0; pointer-events:none; }
+  .mark { position:absolute; background:var(--mark); border-radius:2px; }
+
+  #side { width:360px; flex:none; background:var(--panel); border-left:1px solid var(--line);
+          display:flex; flex-direction:column; }
+  #side header { padding:14px 16px; border-bottom:1px solid var(--line); }
+  #side h1 { margin:0; font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:var(--muted); font-weight:600; }
+  #hint { margin:6px 0 0; font-size:12px; color:var(--muted); }
+  #general { padding:12px 12px 0; }
+  #general label { display:block; font-size:11px; letter-spacing:.04em;
+                   text-transform:uppercase; color:var(--muted); font-weight:600;
+                   margin-bottom:5px; }
+  #general textarea { width:100%; min-height:64px; resize:vertical; font:inherit;
+                      font-size:13px; padding:8px; border-radius:7px;
+                      border:1px solid var(--line); background:var(--bg); color:var(--ink); }
+  #general textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  #list { flex:1; overflow:auto; padding:12px; }
+  .card { border:1px solid var(--line); border-radius:8px; padding:10px; margin-bottom:10px; background:var(--bg); }
+  .card .meta { font-size:11px; color:var(--muted); display:flex; justify-content:space-between; margin-bottom:6px; }
+  .card .meta button { border:0; background:none; color:var(--muted); cursor:pointer; font-size:14px; padding:0 2px; }
+  .card .meta button:hover { color:var(--accent); }
+  .card blockquote { margin:0 0 8px; padding-left:9px; border-left:2px solid var(--accent);
+                     font-size:12.5px; color:var(--ink); max-height:6.4em; overflow:auto; }
+  .card textarea { width:100%; min-height:56px; resize:vertical; border:1px solid var(--line);
+                   border-radius:6px; padding:7px; font:inherit; font-size:13px;
+                   background:var(--panel); color:var(--ink); }
+  .card textarea:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  #work { display:none; padding:10px 12px; border:1px solid var(--accent);
+          border-radius:8px; margin:0 12px 10px; background:var(--bg); }
+  #work.on { display:block; }
+  #work .top { display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--accent); flex:none;
+         animation:pulse 1.1s ease-in-out infinite; }
+  #work.queued { border-color:var(--muted); }
+  #work.queued .dot { background:var(--muted); animation:none; }
+  #listen { margin:6px 0 0; font-size:11px; color:var(--muted); text-align:center; }
+  #listen.deaf { color:#c0392b; font-weight:600; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
+  #workmsg { margin:6px 0 0; font-size:12px; color:var(--muted); word-break:break-word; }
+  #stop { width:100%; margin-top:9px; padding:7px; border:1px solid #a12f2f;
+          border-radius:6px; background:none; color:#a12f2f; font:inherit;
+          font-weight:600; cursor:pointer; }
+  #stop:hover:not(:disabled) { background:#a12f2f; color:#fff; }
+  #stop:disabled { opacity:.5; cursor:default; }
+  #foot { padding:12px 16px; border-top:1px solid var(--line); }
+  #send { width:100%; padding:10px; border:0; border-radius:7px; background:var(--accent);
+          color:#fff; font:inherit; font-weight:600; cursor:pointer; }
+  #send:disabled { opacity:.4; cursor:default; }
+  #status { margin:8px 0 0; font-size:12px; color:var(--muted); min-height:1.2em; text-align:center; }
+  #end { width:100%; margin-top:8px; padding:8px; border:1px solid var(--line); border-radius:7px;
+         background:none; color:var(--muted); font:inherit; cursor:pointer; }
+  #end:hover { color:var(--ink); border-color:var(--muted); }
+
+  #modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex;
+           align-items:center; justify-content:center; z-index:50; }
+  #modal[hidden] { display:none; }
+  .sheet { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:20px; width:340px; box-shadow:0 8px 30px rgba(0,0,0,.3); }
+  .sheet h2 { margin:0 0 8px; font-size:15px; }
+  .sheet p { margin:0 0 16px; font-size:13px; color:var(--muted); }
+  .sheet .warn { color:var(--accent); font-weight:600; }
+  .sheet .row { display:flex; gap:8px; }
+  .sheet button { flex:1; padding:9px; border-radius:7px; font:inherit; cursor:pointer; }
+  #cancelEnd { border:1px solid var(--line); background:none; color:var(--ink); }
+  #confirmEnd { border:0; background:#a12f2f; color:#fff; font-weight:600; }
+  #gone { position:fixed; inset:0; background:var(--bg); z-index:60; display:flex;
+          align-items:center; justify-content:center; flex-direction:column; gap:6px;
+          color:var(--muted); font-size:14px; }
+</style>
+
+<div id="doc"></div>
+<div id="side">
+  <header>
+    <h1>Review</h1>
+    <p id="hint">Select text in the PDF to quote it, then type your note.</p>
+  </header>
+  <div id="general">
+    <label for="overall">Overall note</label>
+    <textarea id="overall" placeholder="Anything that is not tied to one passage — a pass to make, a section to cut, a question to answer."></textarea>
+  </div>
+  <div id="work">
+    <div class="top"><span class="dot"></span><span id="worktitle">Claude is working</span></div>
+    <p id="workmsg"></p>
+    <button id="stop">Stop</button>
+  </div>
+  <div id="list"></div>
+  <div id="foot">
+    <button id="send" disabled>Send to Claude</button>
+    <p id="listen"></p>
+    <p id="status"></p>
+    <button id="end">End session</button>
+  </div>
+</div>
+
+<div id="modal" hidden>
+  <div class="sheet">
+    <h2>End this review session?</h2>
+    <p id="modaltext"></p>
+    <div class="row">
+      <button id="cancelEnd">Cancel</button>
+      <button id="confirmEnd">End session</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const { pdfjsLib } = globalThis;
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const docEl = document.getElementById("doc");
+const listEl = document.getElementById("list");
+const sendEl = document.getElementById("send");
+const overallEl = document.getElementById("overall");
+const statusEl = document.getElementById("status");
+const listenEl = document.getElementById("listen");
+let listening = false;
+
+let comments = [];   // {id, page, quote, comment, rects:[{t,l,w,h}]}
+let nextId = 1;
+let lastMtime = 0;
+
+async function render() {
+  docEl.innerHTML = "";
+  const pdf = await pdfjsLib.getDocument({ url: "/pdf?t=" + Date.now() }).promise;
+  const scale = Math.min(1.7, (docEl.clientWidth - 56) / 612);
+  const dpr = window.devicePixelRatio || 1;
+
+  for (let n = 1; n <= pdf.numPages; n++) {
+    const page = await pdf.getPage(n);
+    const vp = page.getViewport({ scale });
+
+    const wrap = document.createElement("div");
+    wrap.className = "page";
+    wrap.dataset.page = n;
+    wrap.style.width = vp.width + "px";
+    wrap.style.height = vp.height + "px";
+    // PDF.js 3.x positions text spans with calc(var(--scale-factor) * Npx);
+    // without this the whole text layer lands in the wrong place.
+    wrap.style.setProperty("--scale-factor", vp.scale);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(vp.width * dpr);
+    canvas.height = Math.floor(vp.height * dpr);
+    canvas.style.width = vp.width + "px";
+    canvas.style.height = vp.height + "px";
+    wrap.appendChild(canvas);
+
+    const marks = document.createElement("div");
+    marks.className = "marks";
+    wrap.appendChild(marks);
+
+    const text = document.createElement("div");
+    text.className = "textLayer";
+    text.style.width = vp.width + "px";
+    text.style.height = vp.height + "px";
+    wrap.appendChild(text);
+
+    docEl.appendChild(wrap);
+
+    await page.render({
+      canvasContext: canvas.getContext("2d"),
+      viewport: vp,
+      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null,
+    }).promise;
+
+    await pdfjsLib.renderTextLayer({
+      textContentSource: await page.getTextContent(),
+      container: text,
+      viewport: vp,
+    }).promise;
+
+    if (PROBE && n === 1) { probe(); return; }
+  }
+  redrawMarks();
+}
+
+/* ---- self-test ------------------------------------------------------- */
+// ?probe=1 checks that the invisible text spans sit on top of rendered ink.
+// A misaligned text layer selects text that is not where the glyphs are, so
+// coverage collapses. Result is dumped into #probe for headless reading.
+const PROBE = location.search.includes("probe");
+
+function dumpProbe(obj) {
+  const el = document.createElement("pre");
+  el.id = "probe";
+  el.textContent = JSON.stringify(obj, null, 1);
+  document.body.appendChild(el);
+  fetch("/probe", { method: "POST", body: el.textContent }).catch(() => {});
+}
+window.addEventListener("error", e => PROBE && dumpProbe({ error: e.message }));
+window.addEventListener("unhandledrejection", e =>
+  PROBE && dumpProbe({ rejection: String(e.reason && e.reason.message || e.reason) }));
+
+function probe() {
+  const out = [];
+  for (const pageEl of document.querySelectorAll(".page")) {
+    const canvas = pageEl.querySelector("canvas");
+    const ctx = canvas.getContext("2d");
+    const pr = pageEl.getBoundingClientRect();
+    const sx = canvas.width / pr.width, sy = canvas.height / pr.height;
+    const spans = [...pageEl.querySelectorAll(".textLayer span")]
+      .filter(s => s.textContent.trim().length > 3).slice(0, 40);
+    for (const sp of spans) {
+      const r = sp.getBoundingClientRect();
+      const x = Math.round((r.left - pr.left) * sx), y = Math.round((r.top - pr.top) * sy);
+      const w = Math.round(r.width * sx), h = Math.round(r.height * sy);
+      if (w < 2 || h < 2 || x < 0 || y < 0 || x + w > canvas.width || y + h > canvas.height) {
+        out.push({ text: sp.textContent.slice(0, 24), ink: -1 });
+        continue;
+      }
+      const d = ctx.getImageData(x, y, w, h).data;
+      let dark = 0;
+      for (let i = 0; i < d.length; i += 4)
+        if (d[i] < 200 && d[i + 1] < 200 && d[i + 2] < 200) dark++;
+      out.push({ text: sp.textContent.slice(0, 24), ink: dark / (w * h) });
+    }
+    break; // page 1 is enough
+  }
+  const inked = out.filter(o => o.ink > 0.02).length;
+  dumpProbe({ spans: out.length, aligned: inked,
+              ratio: +(inked / Math.max(out.length, 1)).toFixed(3),
+              sample: out.slice(0, 6) });
+}
+
+/* ---- selection -> comment ------------------------------------------- */
+
+document.addEventListener("mouseup", () => {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return;
+  const quote = sel.toString().replace(/\s+/g, " ").trim();
+  if (quote.length < 2) return;
+
+  const pageEl = (sel.anchorNode.nodeType === 1 ? sel.anchorNode : sel.anchorNode.parentElement)
+                   .closest(".page");
+  if (!pageEl) return;
+
+  const pr = pageEl.getBoundingClientRect();
+  const rects = [];
+  const range = sel.getRangeAt(0);
+  for (const r of range.getClientRects()) {
+    if (r.width < 1 || r.height < 1) continue;
+    rects.push({
+      l: (r.left - pr.left) / pr.width * 100,
+      t: (r.top - pr.top) / pr.height * 100,
+      w: r.width / pr.width * 100,
+      h: r.height / pr.height * 100,
+    });
+  }
+
+  comments.push({ id: nextId++, page: +pageEl.dataset.page, quote, comment: "", rects });
+  sel.removeAllRanges();
+  paint();
+  const last = listEl.querySelector(".card:last-child textarea");
+  if (last) { last.focus(); last.scrollIntoView({ block: "nearest" }); }
+});
+
+/* ---- sidebar --------------------------------------------------------- */
+
+function paint() {
+  listEl.innerHTML = "";
+  comments.forEach((c, i) => {
+    const card = document.createElement("div");
+    card.className = "card";
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const label = document.createElement("span");
+    label.textContent = `${i + 1} · page ${c.page}`;
+    const del = document.createElement("button");
+    del.textContent = "×";
+    del.title = "remove";
+    del.onclick = () => { comments = comments.filter(x => x.id !== c.id); paint(); };
+    meta.append(label, del);
+
+    const q = document.createElement("blockquote");
+    q.textContent = c.quote;
+    q.style.cursor = "pointer";
+    q.title = "scroll to highlight";
+    q.onclick = () => document.querySelector(`.page[data-page="${c.page}"]`)
+                              ?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+    const ta = document.createElement("textarea");
+    ta.placeholder = "What should change here?";
+    ta.value = c.comment;
+    ta.oninput = e => { c.comment = e.target.value; sendEl.disabled = !hasWork(); };
+
+    card.append(meta, q, ta);
+    listEl.appendChild(card);
+  });
+  sendEl.disabled = !hasWork();
+  redrawMarks();
+}
+
+const hasWork = () =>
+  comments.some(c => c.comment.trim()) || overallEl.value.trim().length > 0;
+
+overallEl.addEventListener("input", () => { sendEl.disabled = !hasWork(); });
+
+function redrawMarks() {
+  document.querySelectorAll(".marks").forEach(m => (m.innerHTML = ""));
+  for (const c of comments) {
+    const m = document.querySelector(`.page[data-page="${c.page}"] .marks`);
+    if (!m) continue;
+    for (const r of c.rects) {
+      const d = document.createElement("div");
+      d.className = "mark";
+      d.style.cssText = `left:${r.l}%;top:${r.t}%;width:${r.w}%;height:${r.h}%`;
+      m.appendChild(d);
+    }
+  }
+}
+
+/* ---- send + reload --------------------------------------------------- */
+
+sendEl.onclick = async () => {
+  const payload = comments.filter(c => c.comment.trim())
+                          .map(({ page, quote, comment }) => ({ page, quote, comment }));
+  const general = overallEl.value.trim();
+  sendEl.disabled = true;
+  statusEl.textContent = "sending…";
+  try {
+    await fetch("/comments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ comments: payload, general }),
+    });
+    const bits = [];
+    if (payload.length) bits.push(`${payload.length} comment${payload.length > 1 ? "s" : ""}`);
+    if (general) bits.push("overall note");
+    statusEl.textContent = `${bits.join(" + ")} sent`
+      + (listening ? "" : " — but nothing is listening, see below");
+    paintWork({ state: "queued", message: "waiting to be picked up", ts: Date.now() / 1000 });
+  } catch (e) {
+    statusEl.textContent = "send failed: " + e.message;
+    sendEl.disabled = false;
+  }
+};
+
+/* ---- working indicator + stop --------------------------------------- */
+
+const workEl = document.getElementById("work");
+const workTitleEl = document.getElementById("worktitle");
+const workMsgEl = document.getElementById("workmsg");
+const stopEl = document.getElementById("stop");
+let workingSince = 0, stopRequested = false;
+
+function since(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function paintWork(st) {
+  const queued = st.state === "queued";
+  const wrapping = st.state === "done";
+  const on = queued || wrapping || st.state === "working";
+  listening = !!st.listening;
+  // A send only reaches Claude if a waiter is armed, so say which it is
+  // rather than letting a missed wake-up look like silence.
+  listenEl.classList.toggle("deaf", !listening);
+  listenEl.textContent = listening
+    ? "Claude is listening for the next send"
+    : "Claude is NOT listening — a send will sit unread until the session arms "
+      + "a waiter. Say so in the terminal.";
+  workEl.classList.toggle("on", on);
+  workEl.classList.toggle("queued", queued);
+  if (!on) { workingSince = 0; stopRequested = false; stopEl.disabled = false;
+             stopEl.textContent = "Stop"; return; }
+  if (!workingSince) workingSince = st.ts || Date.now() / 1000;
+  stopRequested = stopRequested || st.stop;
+  workTitleEl.textContent = stopRequested
+    ? "Stop requested"
+    : queued
+      ? `Waiting to be picked up · ${since(workingSince)}`
+      : wrapping
+        ? `Wrapping up · ${since(workingSince)}`
+        : `Claude is working · ${since(workingSince)}`;
+  workMsgEl.textContent = stopRequested
+    ? "Claude will halt at its next checkpoint and report what it finished."
+    : queued
+      ? "Your comments are saved. Claude has not started yet — if this sits here, "
+        + "say so in the terminal so the session picks it up."
+      : wrapping
+        ? ((st.message ? st.message + " · " : "")
+           + "edits are done; still writing its reply in the terminal.")
+        : (st.message || "…");
+  stopEl.disabled = stopRequested || wrapping;
+  stopEl.textContent = stopRequested ? "Stopping…" : "Stop";
+}
+
+stopEl.onclick = async () => {
+  stopRequested = true;
+  stopEl.disabled = true;
+  stopEl.textContent = "Stopping…";
+  try { await fetch("/stop", { method: "POST" }); }
+  catch { statusEl.textContent = "could not reach the server to stop"; }
+};
+
+/* ---- end session ------------------------------------------------------ */
+
+const modal = document.getElementById("modal");
+let ended = false;
+
+document.getElementById("end").onclick = () => {
+  const unsent = comments.filter(c => c.comment.trim()).length +
+                 (overallEl.value.trim() ? 1 : 0);
+  document.getElementById("modaltext").innerHTML = unsent
+    ? `<span class="warn">${unsent} comment${unsent > 1 ? "s have" : " has"} not been sent.</span> ` +
+      "Ending now discards them. This shuts down the local server; reopening the " +
+      "page will not work until the skill is started again."
+    : "This shuts down the local server. Reopening the page will not work until " +
+      "the skill is started again.";
+  modal.hidden = false;
+  document.getElementById("cancelEnd").focus();
+};
+
+document.getElementById("cancelEnd").onclick = () => { modal.hidden = true; };
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && !modal.hidden) modal.hidden = true;
+});
+
+document.getElementById("confirmEnd").onclick = async () => {
+  ended = true;
+  modal.hidden = true;
+  // the server dies mid-response, so a failed fetch here is the expected case
+  try { await fetch("/shutdown", { method: "POST" }); } catch {}
+  const gone = document.createElement("div");
+  gone.id = "gone";
+  gone.innerHTML = "<strong>Review session ended.</strong>" +
+                   "<span>The local server has stopped. You can close this tab.</span>";
+  document.body.appendChild(gone);
+};
+
+if (!PROBE) setInterval(async () => {
+  if (ended) return;
+  try {
+    const st = await (await fetch("/state")).json();
+    paintWork(st);
+    const mtime = st.mtime;
+    if (!lastMtime) { lastMtime = mtime; return; }
+    if (mtime > lastMtime) {
+      lastMtime = mtime;
+      comments = [];
+      overallEl.value = "";
+      await render();
+      paint();
+      statusEl.textContent = "PDF rebuilt · " + new Date().toLocaleTimeString();
+    }
+  } catch {}
+}, 1000);
+
+render().catch(e => PROBE && dumpProbe({ error: String(e && e.message || e) }));
+</script>
