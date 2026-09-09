@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""Overleaf git-bridge front end for the pdf-review skill.
+
+Everything here rides Overleaf's git bridge, which is the interface Overleaf
+publishes for programmatic access. No cookies are required for the default
+path; the optional compile mode is the one unsupported piece and it always
+falls back to a local build rather than ending a review session.
+
+  login    --token olp_… | --from-remote DIR    store the account git token
+  secure   DIR                                  strip a token out of a remote
+  session  --cookie … | --clear                 store overleaf_session2
+  open     URL|NAME [--name N] [--dir D]        clone or pull; prints the dir
+  build    [--mode local|overleaf] [--dir D]    build the PDF
+  push     [-m MSG] [--dir D]                   commit, pull --rebase, push
+  list                                          known projects
+  vendor-bst [--dir D]                          copy IEEEtran.bst into the repo
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+REGISTRY = HERE / "projects.json"
+SESSION = HERE / "session.json"
+ASKPASS = HERE / "askpass.sh"
+KEYCHAIN_SERVICE = "overleaf-git-token"
+DEFAULT_ROOT = Path.home() / "Documents" / "Overleaf"
+PROJECT_ID = re.compile(r"[0-9a-f]{24}")
+
+# Build artifacts and skill state must never be pushed into someone's Overleaf
+# project. These go in .git/info/exclude, which is local and never committed.
+LOCAL_EXCLUDES = [
+    ".pdf-review/", "*.aux", "*.log", "*.out", "*.bbl", "*.blg", "*.fls",
+    "*.fdb_latexmk", "*.synctex.gz", "*.toc", "*.lof", "*.lot",
+    # top-level build output only; figures/*.pdf must stay tracked
+    "/*.pdf",
+]
+
+
+# ---------------------------------------------------------------- credentials
+
+def keychain_get() -> str | None:
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+             "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True)
+        return r.stdout.strip() or None if r.returncode == 0 else None
+    except FileNotFoundError:
+        return None
+
+
+def keychain_set(token: str) -> bool:
+    try:
+        # -A: readable by any process running as this user, without an
+        # approval dialog. Without it git's askpass blocks on a GUI prompt and
+        # the clone hangs with no output. Practical exposure matches a 0600
+        # file, but the token is encrypted at rest and stays out of git config
+        # and shell history, which is what we are actually fixing.
+        r = subprocess.run(
+            ["security", "add-generic-password", "-a", os.environ.get("USER", ""),
+             "-s", KEYCHAIN_SERVICE, "-w", token, "-U", "-A"],
+            capture_output=True, text=True)
+        return r.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def write_askpass() -> Path:
+    """A helper git calls for credentials, so the token never enters argv."""
+    ASKPASS.write_text(
+        "#!/bin/sh\n"
+        "case \"$1\" in\n"
+        "  *[Uu]sername*) echo git ;;\n"
+        f"  *) security find-generic-password -a \"$USER\" -s {KEYCHAIN_SERVICE} -w ;;\n"
+        "esac\n")
+    ASKPASS.chmod(0o700)
+    return ASKPASS
+
+
+def git_env() -> dict:
+    env = dict(os.environ)
+    env["GIT_ASKPASS"] = str(write_askpass())
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return env
+
+
+def redact(s: str) -> str:
+    return re.sub(r"olp_[A-Za-z0-9]+", "olp_REDACTED", s)
+
+
+# ------------------------------------------------------------------- registry
+
+def load_registry() -> dict:
+    try:
+        return json.loads(REGISTRY.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_registry(reg: dict) -> None:
+    REGISTRY.write_text(json.dumps(reg, indent=2, sort_keys=True) + "\n")
+
+
+def resolve(target: str) -> tuple[str, str | None]:
+    """Turn a pasted URL, a bare id, or a remembered name into a project id."""
+    t = target.strip()
+    reg = load_registry()
+    if t in reg:
+        return reg[t]["id"], t
+    if re.fullmatch(r"[0-9a-f]{24}", t):
+        return t, None
+    if "/read/" in t or "/rw/" in t or re.search(r"overleaf\.com/[a-z]{10,}/?$", t):
+        raise SystemExit(
+            "That looks like a share or read-only link. It carries a share token,\n"
+            "not a project id, and the git bridge cannot use it. Open the project\n"
+            "in Overleaf and copy the editor URL instead:\n"
+            "  https://www.overleaf.com/project/<24-hex-id>")
+    m = PROJECT_ID.search(t)
+    if m:
+        return m.group(0), None
+    raise SystemExit(f"could not find a project id in: {t}")
+
+
+# ----------------------------------------------------------------------- git
+
+def git(args: list[str], cwd: Path | None = None, check: bool = True,
+        capture: bool = True) -> subprocess.CompletedProcess:
+    # credential.helper= (empty) clears the inherited helper chain. Without it
+    # git consults credential-osxkeychain first and that can block forever on a
+    # GUI approval prompt, so the clone hangs with no output and no error.
+    # GIT_ASKPASS is only reached once the helper chain is empty.
+    r = subprocess.run(["git", "-c", "credential.helper="] + args,
+                       cwd=str(cwd) if cwd else None,
+                       env=git_env(), text=True,
+                       capture_output=capture)
+    if check and r.returncode != 0:
+        out = redact((r.stdout or "") + (r.stderr or ""))
+        raise SystemExit(f"git {' '.join(args[:2])} failed:\n{out}")
+    return r
+
+
+def set_local_excludes(work: Path) -> None:
+    ex = work / ".git" / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    have = ex.read_text() if ex.exists() else ""
+    missing = [p for p in LOCAL_EXCLUDES if p not in have.split()]
+    if missing:
+        with ex.open("a") as fh:
+            fh.write("\n# pdf-review: build artifacts and skill state\n")
+            fh.write("\n".join(missing) + "\n")
+
+
+def bridge_url(pid: str) -> str:
+    return f"https://git.overleaf.com/{pid}"
+
+
+# ---------------------------------------------------------------- subcommands
+
+def cmd_login(a) -> int:
+    token = a.token
+    if a.from_remote:
+        url = git(["remote", "get-url", "origin"], Path(a.from_remote)).stdout
+        m = re.search(r"olp_[A-Za-z0-9]+", url)
+        if not m:
+            raise SystemExit(f"no olp_ token in the origin URL of {a.from_remote}")
+        token = m.group(0)
+    if not token:
+        raise SystemExit("give --token olp_… or --from-remote DIR")
+    if not token.startswith("olp_"):
+        print("warning: tokens normally start with olp_", file=sys.stderr)
+    if not keychain_set(token):
+        raise SystemExit("could not write to the macOS keychain")
+    write_askpass()
+    print("token stored in the login keychain "
+          f"(service {KEYCHAIN_SERVICE}); it is account-wide, so it covers "
+          "every project you own")
+    return 0
+
+
+def cmd_secure(a) -> int:
+    """Take a token out of an existing repo's remote and into the keychain."""
+    work = Path(a.dir).expanduser().resolve()
+    url = git(["remote", "get-url", "origin"], work).stdout.strip()
+    m = re.search(r"olp_[A-Za-z0-9]+", url)
+    pid_m = PROJECT_ID.search(url)
+    if not pid_m:
+        raise SystemExit(f"origin does not look like an Overleaf remote: {redact(url)}")
+    if m and not keychain_get():
+        keychain_set(m.group(0))
+        print("token moved into the keychain")
+    git(["remote", "set-url", "origin", bridge_url(pid_m.group(0))], work)
+    set_local_excludes(work)
+    write_askpass()
+    print(f"origin is now {bridge_url(pid_m.group(0))} (no token on disk)")
+    if m:
+        print("note: the old URL may still be in this repo's reflog and in your "
+              "shell history; rotate the token in Overleaf if that matters to you")
+    return 0
+
+
+def cmd_session(a) -> int:
+    if a.clear:
+        SESSION.unlink(missing_ok=True)
+        print("session cookie cleared; builds will use latexmk")
+        return 0
+    if not a.cookie:
+        raise SystemExit("give --cookie <overleaf_session2 value> or --clear")
+    c = a.cookie.strip()
+    if c.startswith("overleaf_session2="):
+        c = c.split("=", 1)[1]
+    SESSION.write_text(json.dumps({"overleaf_session2": c}))
+    SESSION.chmod(0o600)
+    print("session cookie stored. Overleaf compile mode is available via "
+          "`build --mode overleaf`; it falls back to latexmk whenever the "
+          "session is rejected.")
+    return 0
+
+
+def cmd_open(a) -> int:
+    pid, known = resolve(a.target)
+    reg = load_registry()
+    name = a.name or known
+    if not name:
+        for k, v in reg.items():
+            if v["id"] == pid:
+                name = k
+                break
+    name = name or f"project-{pid[:8]}"
+
+    # A remembered project reopens where it already lives. Falling through to
+    # the default root would clone a second copy beside the first.
+    if a.dir:
+        work = Path(a.dir).expanduser().resolve()
+    elif name in reg and reg[name].get("dir"):
+        work = Path(reg[name]["dir"])
+    else:
+        work = DEFAULT_ROOT / name
+    if not keychain_get():
+        raise SystemExit("no token stored. Run:  overleaf.py login --token olp_…\n"
+                         "Create one in Overleaf under Account Settings → Git "
+                         "integration.")
+    write_askpass()
+
+    if (work / ".git").exists():
+        git(["remote", "set-url", "origin", bridge_url(pid)], work)
+        r = git(["pull", "--rebase"], work, check=False)
+        if r.returncode != 0:
+            print(redact((r.stdout or "") + (r.stderr or "")), file=sys.stderr)
+            print("pull failed; the working tree may have local changes. "
+                  "Resolve them, then re-run.", file=sys.stderr)
+            return 1
+        action = "updated"
+    else:
+        work.parent.mkdir(parents=True, exist_ok=True)
+        git(["clone", bridge_url(pid), str(work)])
+        action = "cloned"
+
+    set_local_excludes(work)
+    reg[name] = {"id": pid, "dir": str(work)}
+    save_registry(reg)
+    head = git(["log", "--oneline", "-1"], work).stdout.strip()
+    print(f"{action}: {name}")
+    print(f"dir: {work}")
+    print(f"head: {head}")
+    return 0
+
+
+# -------------------------------------------------------------------- builds
+
+def find_root_tex(work: Path) -> Path:
+    for cand in ("root.tex", "main.tex"):
+        if (work / cand).exists():
+            return work / cand
+    for p in sorted(work.glob("*.tex")):
+        if "\\documentclass" in p.read_text(errors="ignore"):
+            return p
+    raise SystemExit(f"no root .tex found in {work}")
+
+
+def page_count(pdf: Path) -> int | None:
+    try:
+        r = subprocess.run(["pdfinfo", str(pdf)], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.lower().startswith("pages:"):
+                return int(line.split(":")[1])
+    except (FileNotFoundError, ValueError):
+        pass
+    try:
+        data = pdf.read_bytes()
+        n = len(re.findall(rb"/Type\s*/Page[^s]", data))
+        return n or None
+    except OSError:
+        return None
+
+
+def build_local(work: Path) -> Path:
+    """latexmk, not pdflatex twice: a fresh clone has no .bbl, and pdflatex
+    alone leaves every citation undefined."""
+    root = find_root_tex(work)
+    subprocess.run(["latexmk", "-pdf", "-interaction=nonstopmode", root.name],
+                   cwd=str(work), capture_output=True, text=True)
+    pdf = root.with_suffix(".pdf")
+    if not pdf.exists():
+        raise SystemExit(f"latexmk produced no PDF; see {root.with_suffix('.log')}")
+    return pdf
+
+
+def build_overleaf(work: Path, pid: str) -> Path | None:
+    """Compile on Overleaf. Returns None on any failure, so the caller falls
+    back to a local build rather than ending the review session."""
+    try:
+        cookie = json.loads(SESSION.read_text())["overleaf_session2"]
+    except (OSError, ValueError, KeyError):
+        print("no session cookie stored; run `overleaf.py session --cookie …`",
+              file=sys.stderr)
+        return None
+
+    hdrs = {"Cookie": f"overleaf_session2={cookie}",
+            "User-Agent": "Mozilla/5.0 pdf-review"}
+
+    def get(url: str, headers: dict, data: bytes | None = None):
+        req = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST" if data else "GET")
+        return urllib.request.urlopen(req, timeout=120)
+
+    base = "https://www.overleaf.com"
+    try:
+        with get(f"{base}/project/{pid}", hdrs) as r:
+            html = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        print(f"Overleaf returned {e.code} for the project page; the session "
+              f"cookie is probably expired. Falling back to latexmk.",
+              file=sys.stderr)
+        return None
+    except OSError as e:
+        print(f"could not reach Overleaf ({e}); falling back to latexmk",
+              file=sys.stderr)
+        return None
+
+    m = (re.search(r'name="ol-csrfToken"\s+content="([^"]+)"', html)
+         or re.search(r'content="([^"]+)"\s+name="ol-csrfToken"', html)
+         or re.search(r'"csrfToken"\s*:\s*"([^"]+)"', html))
+    if not m:
+        print("could not find a CSRF token on the project page; the page shape "
+              "changed or the cookie is not logged in. Falling back to latexmk.",
+              file=sys.stderr)
+        return None
+    csrf = m.group(1)
+
+    body = json.dumps({"check": "silent", "draft": False,
+                       "incrementalCompilesEnabled": True,
+                       "stopOnFirstError": False}).encode()
+    ch = dict(hdrs, **{"Content-Type": "application/json", "x-csrf-token": csrf,
+                       "Accept": "application/json", "Referer": f"{base}/project/{pid}"})
+    try:
+        with get(f"{base}/project/{pid}/compile", ch, body) as r:
+            resp = json.loads(r.read().decode("utf-8", "replace"))
+    except (urllib.error.HTTPError, OSError, ValueError) as e:
+        print(f"compile request failed ({e}); falling back to latexmk",
+              file=sys.stderr)
+        return None
+
+    # Read the PDF's location out of the response rather than assuming a path,
+    # so a change on their side surfaces as a clear error instead of a 404.
+    out = None
+    for f in resp.get("outputFiles", []):
+        if str(f.get("path", "")).endswith("output.pdf"):
+            out = f.get("url")
+            break
+    if not out:
+        dbg = work / ".pdf-review" / "overleaf-compile.json"
+        dbg.parent.mkdir(parents=True, exist_ok=True)
+        dbg.write_text(json.dumps(resp, indent=2))
+        print(f"no output.pdf in the compile response (status "
+              f"{resp.get('status')!r}); raw response saved to {dbg}. "
+              f"Falling back to latexmk.", file=sys.stderr)
+        return None
+
+    try:
+        with get(out if out.startswith("http") else base + out, hdrs) as r:
+            data = r.read()
+    except (urllib.error.HTTPError, OSError) as e:
+        print(f"could not download the compiled PDF ({e}); falling back",
+              file=sys.stderr)
+        return None
+
+    pdf = find_root_tex(work).with_suffix(".pdf")
+    pdf.write_bytes(data)
+    return pdf
+
+
+def cmd_build(a) -> int:
+    work = Path(a.dir).expanduser().resolve() if a.dir else Path.cwd()
+    root = find_root_tex(work)
+    mode = a.mode
+    pdf = None
+
+    if mode == "overleaf":
+        url = git(["remote", "get-url", "origin"], work, check=False).stdout
+        m = PROJECT_ID.search(url or "")
+        if not m:
+            print("not an Overleaf checkout; building locally", file=sys.stderr)
+        else:
+            if a.push_first:
+                cmd_push(argparse.Namespace(
+                    dir=str(work), force_assets=False,
+                    message=a.message or "pdf-review: sync before compile"))
+            else:
+                print("note: Overleaf compiles what is in the project, not your "
+                      "working tree. Pass --push-first to sync your edits.",
+                      file=sys.stderr)
+            pdf = build_overleaf(work, m.group(0))
+        if pdf is None:
+            mode = "local (fell back)"
+
+    if pdf is None:
+        pdf = build_local(work)
+
+    log = root.with_suffix(".log")
+    undef = 0
+    if log.exists():
+        undef = len(re.findall(r"Citation .* undefined",
+                               log.read_text(errors="ignore")))
+        overfull = len(re.findall(r"Overfull", log.read_text(errors="ignore")))
+    else:
+        overfull = 0
+    print(f"pdf: {pdf}")
+    print(f"mode: {mode}")
+    print(f"pages: {page_count(pdf)}")
+    print(f"undefined citations: {undef}")
+    print(f"overfull boxes: {overfull}")
+    if undef:
+        print("warning: citations did not resolve. If IEEEtran.bst is missing "
+              "from the repo, run `overleaf.py vendor-bst`.", file=sys.stderr)
+    return 0
+
+
+GRAPHICS = re.compile(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}")
+ASSET_EXTS = ["", ".pdf", ".png", ".jpg", ".jpeg", ".eps"]
+
+
+def dropped_assets(work: Path) -> list[str]:
+    """Figures that exist on disk but git will silently skip.
+
+    Overleaf Connect writes a .gitignore with a bare `*.pdf` rule. A project
+    without a matching `!figures/*.pdf` negation therefore drops every PDF
+    figure from `git add -A` — the local build keeps working because the file
+    is still on disk, and Overleaf breaks with a missing figure. Catch it at
+    push time, which is the last moment it is still cheap.
+    """
+    refs = set()
+    for tex in work.rglob("*.tex"):
+        try:
+            refs.update(GRAPHICS.findall(tex.read_text(errors="ignore")))
+        except OSError:
+            continue
+    bad = []
+    for ref in sorted(refs):
+        for ext in ASSET_EXTS:
+            f = work / (ref + ext)
+            if not f.is_file():
+                continue
+            rel = str(f.relative_to(work))
+            tracked = git(["ls-files", "--error-unmatch", rel], work,
+                          check=False).returncode == 0
+            ignored = git(["check-ignore", "-q", rel], work,
+                          check=False).returncode == 0
+            if ignored and not tracked:
+                bad.append(rel)
+            break
+    return bad
+
+
+def cmd_push(a) -> int:
+    work = Path(a.dir).expanduser().resolve() if a.dir else Path.cwd()
+    set_local_excludes(work)
+
+    bad = dropped_assets(work)
+    if bad and not a.force_assets:
+        print("These figures are referenced by the document, exist on disk, and "
+              "are ignored by git, so pushing would leave Overleaf with a "
+              "missing figure while your local build keeps working:\n",
+              file=sys.stderr)
+        for f in bad:
+            print(f"  {f}", file=sys.stderr)
+        print("\nFix the .gitignore (a `!figures/*.pdf` line after the `*.pdf` "
+              "rule), or re-run with --force-assets to add them anyway. "
+              "Nothing was pushed.", file=sys.stderr)
+        return 1
+    if bad:
+        git(["add", "-f"] + bad, work)
+        print(f"force-added {len(bad)} ignored figure(s)")
+
+    git(["add", "-A"], work)
+    staged = git(["diff", "--cached", "--name-only"], work).stdout.strip()
+    if staged:
+        git(["commit", "-m", a.message or "pdf-review: apply comments"], work)
+    else:
+        print("nothing to commit")
+    r = git(["pull", "--rebase"], work, check=False)
+    if r.returncode != 0:
+        git(["rebase", "--abort"], work, check=False)
+        print(redact((r.stdout or "") + (r.stderr or "")), file=sys.stderr)
+        print("\nThe rebase onto Overleaf did not complete, so nothing was "
+              "pushed. Any rebase in progress was aborted and your commit is "
+              "intact on the local branch. The usual cause is a co-author "
+              "editing the project in the web editor while you were editing "
+              "here; the git output above says which. Resolve by hand:\n"
+              f"  cd {work} && git pull --rebase", file=sys.stderr)
+        return 1
+    p = git(["push"], work, check=False)
+    if p.returncode != 0:
+        print(redact((p.stdout or "") + (p.stderr or "")), file=sys.stderr)
+        return 1
+    print(f"pushed: {git(['log', '--oneline', '-1'], work).stdout.strip()}")
+    return 0
+
+
+def cmd_list(a) -> int:
+    reg = load_registry()
+    if not reg:
+        print("no projects yet. Open one:  overleaf.py open <overleaf-url>")
+        return 0
+    for name, v in sorted(reg.items()):
+        exists = "" if Path(v["dir"]).exists() else "   (directory missing)"
+        print(f"{name:24} {v['id']}  {v['dir']}{exists}")
+    return 0
+
+
+def cmd_vendor_bst(a) -> int:
+    """IEEEtran.bst is the one build input that is not in the repo, so it is the
+    one place your render and Overleaf's can differ."""
+    work = Path(a.dir).expanduser().resolve() if a.dir else Path.cwd()
+    if (work / "IEEEtran.bst").exists():
+        print("IEEEtran.bst is already in the repo")
+        return 0
+    r = subprocess.run(["kpsewhich", "IEEEtran.bst"], capture_output=True, text=True)
+    src = r.stdout.strip()
+    if not src or not Path(src).exists():
+        raise SystemExit("could not locate IEEEtran.bst in your TeX installation")
+    (work / "IEEEtran.bst").write_bytes(Path(src).read_bytes())
+    print(f"copied {src} -> {work / 'IEEEtran.bst'}")
+    print("commit and push it so Overleaf uses the same bibliography style")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("login"); p.add_argument("--token"); p.add_argument("--from-remote")
+    p.set_defaults(fn=cmd_login)
+    p = sub.add_parser("secure"); p.add_argument("dir"); p.set_defaults(fn=cmd_secure)
+    p = sub.add_parser("session"); p.add_argument("--cookie")
+    p.add_argument("--clear", action="store_true"); p.set_defaults(fn=cmd_session)
+    p = sub.add_parser("open"); p.add_argument("target"); p.add_argument("--name")
+    p.add_argument("--dir"); p.set_defaults(fn=cmd_open)
+    p = sub.add_parser("build"); p.add_argument("--dir")
+    p.add_argument("--mode", choices=["local", "overleaf"], default="local")
+    p.add_argument("--push-first", action="store_true"); p.add_argument("-m", "--message")
+    p.set_defaults(fn=cmd_build)
+    p = sub.add_parser("push"); p.add_argument("--dir")
+    p.add_argument("-m", "--message")
+    p.add_argument("--force-assets", action="store_true")
+    p.set_defaults(fn=cmd_push)
+    p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("vendor-bst"); p.add_argument("--dir"); p.set_defaults(fn=cmd_vendor_bst)
+
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

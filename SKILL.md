@@ -16,18 +16,51 @@ the first round, after each rebuild, after a stop, after a question. If you end
 a turn with no waiter armed, the user's next Send lands in a file nobody is
 watching and the session looks dead to them.
 
+## Step 0: Open the project (Overleaf-backed papers)
+
+Skip this when the user is already sitting in a checkout. When they give you an
+Overleaf URL, or name a project you have opened before, go through
+`overleaf.py` rather than asking them to set up a remote:
+
+```bash
+python3 ~/.claude/skills/pdf-review/overleaf.py open \
+  https://www.overleaf.com/project/<24-hex-id> --name <short-name>
+```
+
+It clones or pulls, registers the name so they can say "open <short-name>" next
+time, and prints the working directory. Every later command takes `--dir` with
+that path.
+
+Auth is one account-wide git token, stored once in the keychain
+(`overleaf.py login --token olp_…`, created in Overleaf under Account
+Settings -> Git integration). It covers every project the user owns, so a new
+project needs no new credential. If a repo still has a token embedded in its
+remote URL, `overleaf.py secure <dir>` moves it into the keychain and strips
+the URL.
+
+Only the editor URL carries a project id. A `/read/` or share link holds a
+share token instead and the git bridge cannot use it; `open` says so rather
+than failing at the clone.
+
 ## Step 1: Start the viewer
 
 Default to `root.pdf` in the working directory unless the user names another.
 Rebuild first if the PDF is older than any `.tex` file, so the user marks up
 current output.
 
-Run the server with Bash `run_in_background: true`:
+Run the supervisor, not `server.py` directly, with Bash
+`run_in_background: true`:
 
 ```bash
-python3 ~/.claude/skills/pdf-review/server.py \
+python3 ~/.claude/skills/pdf-review/serve.py \
   --pdf root.pdf --out .pdf-review/pending.md
 ```
+
+`serve.py` restarts the server on the same port if it exits unexpectedly. The
+server has been seen dying to an outside signal mid-session with no traceback
+and no OS log entry, which breaks Send silently, so supervise it rather than
+trusting it to stay up. A clean exit, meaning the viewer's End session button,
+stops the supervisor with it.
 
 The first line of output is the URL. Read it from the background output, open it
 (`open <url>`), and tell the user the URL in case the browser does not focus.
@@ -143,9 +176,17 @@ and only edit if the answer implies a change.
 
 ## Step 5: Rebuild, re-arm, report
 
-Rebuild per the repo's convention — usually `pdflatex -interaction=nonstopmode
-root.tex` twice, from the repo root. Check `root.log` for `Overfull` and check
-the page count. The viewer polls the PDF mtime and reloads within ~2s.
+Rebuild with `overleaf.py build --dir <path>`, which runs `latexmk -pdf` and
+reports the PDF path, the page count, undefined citations, and overfull boxes
+in one line each. Use it rather than `pdflatex` twice: a fresh clone carries no
+`.bbl`, and two bare `pdflatex` passes leave every citation undefined while
+still exiting zero, so the user gets a PDF full of `[?]` that looks like a
+broken integration. The viewer polls the PDF mtime and reloads within ~2s.
+
+If undefined citations are reported, `IEEEtran.bst` (or whatever the paper's
+style is) may not be in the repo. `overleaf.py vendor-bst --dir <path>` copies
+it in from the local TeX installation, which also removes the last input file
+that can differ between your render and Overleaf's.
 
 Then, in this order:
 
@@ -164,13 +205,55 @@ Leave the server running for another pass. The user ends it themselves with the
 prints `session ended`. If they ask you to stop it instead, use TaskStop — and
 kill the waiter too, or it will hold a stale heartbeat.
 
+## Step 6: Push back to Overleaf
+
+Only for Overleaf-backed checkouts, and only when the user asks or the pass is
+finished. Edits are theirs to publish, not yours to publish for them.
+
+```bash
+python3 ~/.claude/skills/pdf-review/overleaf.py push --dir <path> -m "<summary>"
+```
+
+It commits, rebases onto whatever moved on Overleaf, and pushes. Build
+artifacts and `.pdf-review/` are held out through `.git/info/exclude`, which is
+local and never committed, so a push carries source only.
+
+A conflicting rebase is aborted rather than resolved. The user's co-authors
+edit the same project in the web editor and their change wins by being
+concurrent, not by being right, so the command stops, leaves the commit intact
+on the local branch, and says what to do. Report that plainly; do not retry with
+force.
+
+## Two build modes
+
+`build --mode local` is the default and runs `latexmk` on the machine. Use it
+for the review loop.
+
+`build --mode overleaf --push-first` compiles on Overleaf and downloads the
+result. It exists for one job — checking the render the user's co-authors and
+the submission see before a deadline — and it is the only part of this skill
+that depends on an interface Overleaf does not publish. It needs a session
+cookie (`overleaf.py session --cookie …`, read out of the browser) and any
+failure, meaning an expired cookie, a changed page shape, or a compile error,
+falls back to a local build and says so. A dead cookie must never end a review
+session.
+
+Note the ordering: Overleaf compiles what is in the project, not the working
+tree, so this mode has to push first. That makes every rebuild in this mode a
+write the user's co-authors see, which is the other reason it is a
+before-submission check and not the loop's build step.
+
 ## Notes
 
 - Localhost only. It reads the PDF and writes files under `.pdf-review/`;
   nothing leaves the machine.
 - `.pdf-review/` holds `pending.md` (unclaimed sends), `inbox/` (claimed ones),
   `queue.json` (the send and claim counters), `watcher.json` (the waiter's
-  heartbeat), `status.json`, and `events.log`.
+  heartbeat), `status.json`, `events.log`, and `server.log`.
+- A restart is survivable. The waiter polls `queue.json` rather than the server,
+  so it lives through one, and the browser tab reconnects on its next poll with
+  its highlights intact. If the server is down the viewer says so in red, since
+  a Send cannot reach it. Restarts are recorded in `events.log`.
 - Highlights are cleared on reload, since the old page coordinates do not
   survive a reflow.
 - Comments with an empty note are dropped at send.

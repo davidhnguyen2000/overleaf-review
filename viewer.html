@@ -147,15 +147,21 @@ let listening = false;
 let comments = [];   // {id, page, quote, comment, rects:[{t,l,w,h}]}
 let nextId = 1;
 let lastMtime = 0;
+let settlingMtime = 0, settledFor = 0;
+
+let renderToken = 0;
 
 async function render() {
-  docEl.innerHTML = "";
+  const mine = ++renderToken;
   const pdf = await pdfjsLib.getDocument({ url: "/pdf?t=" + Date.now() }).promise;
+  if (mine !== renderToken) return;      // a newer render already owns the page
+  docEl.innerHTML = "";
   const scale = Math.min(1.7, (docEl.clientWidth - 56) / 612);
   const dpr = window.devicePixelRatio || 1;
 
   for (let n = 1; n <= pdf.numPages; n++) {
     const page = await pdf.getPage(n);
+    if (mine !== renderToken) return;
     const vp = page.getViewport({ scale });
 
     const wrap = document.createElement("div");
@@ -191,6 +197,7 @@ async function render() {
       viewport: vp,
       transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : null,
     }).promise;
+    if (mine !== renderToken) return;
 
     await pdfjsLib.renderTextLayer({
       textContentSource: await page.getTextContent(),
@@ -466,15 +473,29 @@ if (!PROBE) setInterval(async () => {
     paintWork(st);
     const mtime = st.mtime;
     if (!lastMtime) { lastMtime = mtime; return; }
+    // A rebuild is two or three pdflatex passes, so the mtime moves several
+    // times a second or two apart. Wait for it to settle instead of reloading
+    // once per pass and throwing away the reader's comments each time.
     if (mtime > lastMtime) {
+      if (mtime !== settlingMtime) { settlingMtime = mtime; settledFor = 0; return; }
+      if (++settledFor < 2) return;
       lastMtime = mtime;
+      settlingMtime = 0;
+      settledFor = 0;
       comments = [];
       overallEl.value = "";
       await render();
       paint();
       statusEl.textContent = "PDF rebuilt · " + new Date().toLocaleTimeString();
     }
-  } catch {}
+  } catch {
+    // the server is gone: Send cannot reach it, so never leave the listening
+    // line asserting otherwise
+    listening = false;
+    listenEl.classList.add("deaf");
+    listenEl.textContent = "Review server not reachable — Send will fail. "
+      + "Ask in the terminal to restart it; nothing already sent is lost.";
+  }
 }, 1000);
 
 render().catch(e => PROBE && dumpProbe({ error: String(e && e.message || e) }));
