@@ -16,31 +16,68 @@ the first round, after each rebuild, after a stop, after a question. If you end
 a turn with no waiter armed, the user's next Send lands in a file nobody is
 watching and the session looks dead to them.
 
-## Step 0: Open the project (Overleaf-backed papers)
+## Step 0: First run, and opening a project
 
-Skip this when the user is already sitting in a checkout. When they give you an
-Overleaf URL, or name a project you have opened before, go through
-`overleaf.py` rather than asking them to set up a remote:
+**Run the setup check before anything else on a machine you have not used this
+on**, and whenever a command here fails in a way that smells like a missing
+piece:
+
+```bash
+python3 ~/.claude/skills/pdf-review/overleaf.py setup
+```
+
+It reports Python, `git`, `latexmk`, whether a token is stored and in which
+credential store, whether the Stop hook is wired, and which projects are known.
+When something is missing it prints numbered fixes and exits non-zero.
+
+Do not paste that output at the user. Read it, then walk them through the
+missing pieces one at a time, in order, and wait for each to land before naming
+the next. Setup is where someone decides whether the tool is worth their
+afternoon, so a wall of diagnostics is worse than a single sentence saying what
+to do now. Two of the steps need something only they can do:
+
+- **The token.** They create it in Overleaf under Account Settings -> Git
+  integration, then give it to you to run `overleaf.py login --token olp_…`.
+  Say plainly that it is account-wide and stored in the machine's credential
+  store, not in the repo. If the token turns out to be unavailable because their
+  Overleaf plan lacks Git integration, say so directly — it is a paid feature,
+  and no amount of retrying will produce one.
+- **The Stop hook**, which they add to `~/.claude/settings.json`. Offer to make
+  the edit rather than describing it, and say what it is for: without it the
+  viewer's spinner never stops.
+
+On a machine with no system keyring the token lands in a `0600` file next to
+the script, which is a supported outcome and not a warning to escalate. For a
+headless or shared box, `$OVERLEAF_GIT_TOKEN` takes precedence over every store
+and leaves nothing on disk.
+
+### Opening a project
+
+Skip all of this when the user is already sitting in a checkout that builds.
+When they give you an Overleaf URL, or name a project opened before:
 
 ```bash
 python3 ~/.claude/skills/pdf-review/overleaf.py open \
   https://www.overleaf.com/project/<24-hex-id> --name <short-name>
 ```
 
-It clones or pulls, registers the name so they can say "open <short-name>" next
-time, and prints the working directory. Every later command takes `--dir` with
-that path.
-
-Auth is one account-wide git token, stored once in the keychain
-(`overleaf.py login --token olp_…`, created in Overleaf under Account
-Settings -> Git integration). It covers every project the user owns, so a new
-project needs no new credential. If a repo still has a token embedded in its
-remote URL, `overleaf.py secure <dir>` moves it into the keychain and strips
-the URL.
+It clones or pulls, registers the name so `open <short-name>` works next time,
+and prints the working directory. Every later command takes `--dir` with that
+path. If a repo still has a token embedded in its remote URL,
+`overleaf.py secure <dir>` moves it into the credential store and strips the
+URL.
 
 Only the editor URL carries a project id. A `/read/` or share link holds a
 share token instead and the git bridge cannot use it; `open` says so rather
 than failing at the clone.
+
+Build once before starting the viewer, and read the result back to the user as
+a sentence rather than a dump — page count and undefined citations are the two
+numbers that matter:
+
+```bash
+python3 ~/.claude/skills/pdf-review/overleaf.py build --dir <path>
+```
 
 ## Step 1: Start the viewer
 

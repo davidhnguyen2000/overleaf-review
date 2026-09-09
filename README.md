@@ -44,8 +44,15 @@ Also needed:
   you both. `latexmk` matters: a fresh clone carries no `.bbl`, and running
   `pdflatex` twice by hand leaves every citation undefined while still exiting
   zero, so you get a PDF full of `[?]` that looks like a broken install.
-- **macOS**, for now. The token is stored in the login keychain via `security`.
-  Everything else is portable; a Linux port needs a different credential store.
+- **macOS, Linux, or anywhere Python and Git run.** The token goes into the
+  best store the machine offers: the login keychain on macOS, libsecret
+  (`secret-tool`) on Linux, and otherwise a `0600` file next to the script. The
+  file is a supported outcome, not a degraded one — plenty of Linux machines
+  run no keyring daemon, and a review session should not depend on one. On a
+  headless or shared box, set `OVERLEAF_GIT_TOKEN` instead: it takes precedence
+  over every store and leaves nothing on disk. `OVERLEAF_CRED_BACKEND` pins one
+  of `keychain`, `libsecret`, or `file` when a keyring is present but
+  misbehaving.
 - **A browser with network access on first load.** The viewer pulls PDF.js from
   a CDN. Nothing else leaves the machine: the server binds `127.0.0.1`, and your
   PDF and comments never go anywhere.
@@ -85,17 +92,29 @@ stops:
 }
 ```
 
+### Check the install
+
+```bash
+python3 ~/.claude/skills/pdf-review/overleaf.py setup
+```
+
+It reports Python, `git`, `latexmk`, whether a token is stored and where,
+whether the Stop hook is wired, and which projects are known — and prints the
+exact command for anything missing. Run it first on a new machine, and again if
+something later fails oddly. Claude also runs it for you the first time you use
+the skill and walks you through whatever it finds.
+
 ### Connect Overleaf
 
-Store your token once. It goes into the login keychain, not into any file or
-remote URL:
+Store your token once. It goes into your machine's credential store, not into
+any file in the repo and not into a Git remote URL:
 
 ```bash
 python3 ~/.claude/skills/pdf-review/overleaf.py login --token olp_xxxxxxxx
 ```
 
 Already using a repo with the token baked into its Git remote? Move it into the
-keychain and strip the URL:
+credential store and strip the URL:
 
 ```bash
 python3 ~/.claude/skills/pdf-review/overleaf.py secure ~/path/to/that/repo
@@ -232,7 +251,7 @@ none of it reaches Overleaf and your project's own `.gitignore` is left alone.
 | file | what it is |
 | --- | --- |
 | `SKILL.md` | the instructions Claude follows |
-| `overleaf.py` | Overleaf Git bridge: token, clone/pull, build, push |
+| `overleaf.py` | Overleaf Git bridge: setup check, token, clone/pull, build, push |
 | `serve.py` | supervisor that keeps `server.py` up and restarts it on an unexpected exit |
 | `server.py` | localhost HTTP server: serves the PDF and the viewer, collects sends |
 | `viewer.html` | the review GUI — PDF.js render, text-layer selection, sidebar |

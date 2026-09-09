@@ -12,6 +12,7 @@ falls back to a local build rather than ending a review session.
   open     URL|NAME [--name N] [--dir D]        clone or pull; prints the dir
   build    [--mode local|overleaf] [--dir D]    build the PDF
   push     [-m MSG] [--dir D]                   commit, pull --rebase, push
+  setup                                         check the install, say what is missing
   list                                          known projects
   vendor-bst [--dir D]                          copy IEEEtran.bst into the repo
 """
@@ -31,7 +32,7 @@ HERE = Path(__file__).resolve().parent
 REGISTRY = HERE / "projects.json"
 SESSION = HERE / "session.json"
 ASKPASS = HERE / "askpass.sh"
-KEYCHAIN_SERVICE = "overleaf-git-token"
+KEYCHAIN_SERVICE = "overleaf-git-token"  # keyring service name, all platforms
 DEFAULT_ROOT = Path.home() / "Documents" / "Overleaf"
 PROJECT_ID = re.compile(r"[0-9a-f]{24}")
 
@@ -46,50 +47,170 @@ LOCAL_EXCLUDES = [
 
 
 # ---------------------------------------------------------------- credentials
+#
+# One token, stored in the best place the machine offers. In order: an
+# environment variable (CI, containers, headless boxes), the macOS keychain,
+# libsecret on Linux, then a 0600 file next to this script. The file is a real
+# fallback, not a failure: plenty of Linux machines have no keyring daemon
+# running, and a review session must not depend on one.
+#
+# Every lookup is time-limited. A credential helper that blocks on a GUI unlock
+# prompt is indistinguishable from a hung clone, and that failure has already
+# cost us once.
 
-def keychain_get() -> str | None:
+CRED_FILE = HERE / "credentials.json"
+ENV_VAR = "OVERLEAF_GIT_TOKEN"
+CRED_TIMEOUT = 10
+
+
+def _run(cmd: list[str], stdin: str | None = None):
     try:
-        r = subprocess.run(
-            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
-             "-s", KEYCHAIN_SERVICE, "-w"],
-            capture_output=True, text=True)
-        return r.stdout.strip() or None if r.returncode == 0 else None
-    except FileNotFoundError:
+        return subprocess.run(cmd, input=stdin, capture_output=True, text=True,
+                              timeout=CRED_TIMEOUT)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
 
 
-def keychain_set(token: str) -> bool:
+def _have(exe: str) -> bool:
+    from shutil import which
+    return which(exe) is not None
+
+
+def _mac_get() -> str | None:
+    r = _run(["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+              "-s", KEYCHAIN_SERVICE, "-w"])
+    return (r.stdout.strip() or None) if r and r.returncode == 0 else None
+
+
+def _mac_set(token: str) -> bool:
+    # -A: readable by any process running as this user, without an approval
+    # dialog. Without it git's askpass blocks on a GUI prompt and the clone
+    # hangs with no output. Practical exposure matches a 0600 file, but the
+    # token is encrypted at rest and stays out of git config and shell history,
+    # which is what we are actually fixing.
+    r = _run(["security", "add-generic-password", "-a", os.environ.get("USER", ""),
+              "-s", KEYCHAIN_SERVICE, "-w", token, "-U", "-A"])
+    return bool(r and r.returncode == 0)
+
+
+def _secret_get() -> str | None:
+    r = _run(["secret-tool", "lookup", "service", KEYCHAIN_SERVICE,
+              "account", os.environ.get("USER", "")])
+    return (r.stdout.strip() or None) if r and r.returncode == 0 else None
+
+
+def _secret_set(token: str) -> bool:
+    r = _run(["secret-tool", "store", "--label=Overleaf git token",
+              "service", KEYCHAIN_SERVICE, "account", os.environ.get("USER", "")],
+             stdin=token)
+    return bool(r and r.returncode == 0)
+
+
+def _file_get() -> str | None:
     try:
-        # -A: readable by any process running as this user, without an
-        # approval dialog. Without it git's askpass blocks on a GUI prompt and
-        # the clone hangs with no output. Practical exposure matches a 0600
-        # file, but the token is encrypted at rest and stays out of git config
-        # and shell history, which is what we are actually fixing.
-        r = subprocess.run(
-            ["security", "add-generic-password", "-a", os.environ.get("USER", ""),
-             "-s", KEYCHAIN_SERVICE, "-w", token, "-U", "-A"],
-            capture_output=True, text=True)
-        return r.returncode == 0
-    except FileNotFoundError:
+        return json.loads(CRED_FILE.read_text()).get("token") or None
+    except (OSError, ValueError):
+        return None
+
+
+def _file_set(token: str) -> bool:
+    try:
+        CRED_FILE.write_text(json.dumps({"token": token}))
+        CRED_FILE.chmod(0o600)
+        return True
+    except OSError:
         return False
 
 
+BACKEND_VAR = "OVERLEAF_CRED_BACKEND"
+
+
+def backends() -> list[tuple[str, object, object]]:
+    """(name, getter, setter) for the stores this machine can actually use.
+
+    $OVERLEAF_CRED_BACKEND pins one of keychain/libsecret/file, for a machine
+    whose keyring is present but misbehaving.
+    """
+    pin = os.environ.get(BACKEND_VAR, "").strip().lower()
+    out = []
+    if sys.platform == "darwin" and _have("security"):
+        out.append(("keychain", "macOS keychain", _mac_get, _mac_set))
+    if _have("secret-tool"):
+        out.append(("libsecret", "libsecret", _secret_get, _secret_set))
+    out.append(("file", f"file {CRED_FILE.name} (0600)", _file_get, _file_set))
+    if pin:
+        out = [b for b in out if b[0] == pin] or out
+    return [(label, g, st) for _key, label, g, st in out]
+
+
+def cred_get() -> str | None:
+    env = os.environ.get(ENV_VAR, "").strip()
+    if env:
+        return env
+    for _, get, _set in backends():
+        v = get()
+        if v:
+            return v
+    return None
+
+
+def cred_set(token: str) -> str:
+    """Store the token, returning the name of the store that took it."""
+    errors = []
+    for name, _get, setter in backends():
+        if setter(token):
+            # Confirm it reads back. A keyring that accepts a write and then
+            # cannot be read is worse than never having used it.
+            if _get() == token or name.startswith("file"):
+                return name
+            errors.append(f"{name}: wrote but could not read back")
+        else:
+            errors.append(f"{name}: unavailable")
+    raise SystemExit("could not store the token anywhere:\n  "
+                     + "\n  ".join(errors))
+
+
+def cred_where() -> str | None:
+    """Which store currently holds a token, for the setup report."""
+    if os.environ.get(ENV_VAR, "").strip():
+        return f"${ENV_VAR}"
+    for name, get, _s in backends():
+        if get():
+            return name
+    return None
+
+
 def write_askpass() -> Path:
-    """A helper git calls for credentials, so the token never enters argv."""
+    """The helper git calls for credentials, so the token never enters argv.
+
+    It defers straight back to this script rather than embedding any one
+    platform's lookup command, so every backend works the same way.
+    """
     ASKPASS.write_text(
         "#!/bin/sh\n"
-        "case \"$1\" in\n"
-        "  *[Uu]sername*) echo git ;;\n"
-        f"  *) security find-generic-password -a \"$USER\" -s {KEYCHAIN_SERVICE} -w ;;\n"
-        "esac\n")
+        f'exec {sys.executable} "{Path(__file__).resolve()}" _askpass "$1"\n')
     ASKPASS.chmod(0o700)
     return ASKPASS
+
+
+def cmd_askpass(a) -> int:
+    if "user" in (a.prompt or "").lower():
+        print("git")
+        return 0
+    tok = cred_get()
+    if not tok:
+        return 1
+    print(tok)
+    return 0
 
 
 def git_env() -> dict:
     env = dict(os.environ)
     env["GIT_ASKPASS"] = str(write_askpass())
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # SSH_ASKPASS_REQUIRE / DISPLAY are irrelevant for https, but an unset
+    # DISPLAY stops some helpers from trying to open a GUI prompt at all.
+    env.pop("SSH_ASKPASS", None)
     return env
 
 
@@ -177,12 +298,17 @@ def cmd_login(a) -> int:
         raise SystemExit("give --token olp_… or --from-remote DIR")
     if not token.startswith("olp_"):
         print("warning: tokens normally start with olp_", file=sys.stderr)
-    if not keychain_set(token):
-        raise SystemExit("could not write to the macOS keychain")
+    where = cred_set(token)
     write_askpass()
-    print("token stored in the login keychain "
-          f"(service {KEYCHAIN_SERVICE}); it is account-wide, so it covers "
-          "every project you own")
+    print(f"token stored in: {where}")
+    print("it is account-wide, so it covers every project you own")
+    if where.startswith("file"):
+        print(f"\nNo system keyring was usable here, so the token is in "
+              f"{CRED_FILE}, readable only by you. On Linux, installing "
+              f"libsecret (`secret-tool`) and re-running login moves it into "
+              f"the keyring. For a headless or shared machine, prefer the "
+              f"{ENV_VAR} environment variable, which takes precedence over "
+              f"every store and leaves nothing on disk.")
     return 0
 
 
@@ -194,9 +320,8 @@ def cmd_secure(a) -> int:
     pid_m = PROJECT_ID.search(url)
     if not pid_m:
         raise SystemExit(f"origin does not look like an Overleaf remote: {redact(url)}")
-    if m and not keychain_get():
-        keychain_set(m.group(0))
-        print("token moved into the keychain")
+    if m and not cred_get():
+        print(f"token moved into: {cred_set(m.group(0))}")
     git(["remote", "set-url", "origin", bridge_url(pid_m.group(0))], work)
     set_local_excludes(work)
     write_askpass()
@@ -244,10 +369,12 @@ def cmd_open(a) -> int:
         work = Path(reg[name]["dir"])
     else:
         work = DEFAULT_ROOT / name
-    if not keychain_get():
-        raise SystemExit("no token stored. Run:  overleaf.py login --token olp_…\n"
-                         "Create one in Overleaf under Account Settings → Git "
-                         "integration.")
+    if not cred_get():
+        raise SystemExit(
+            "No Overleaf token stored yet. Create one in Overleaf under\n"
+            "Account Settings -> Git integration, then run:\n"
+            "  overleaf.py login --token olp_…\n"
+            "Run `overleaf.py setup` to check the rest of the install.")
     write_askpass()
 
     if (work / ".git").exists():
@@ -553,6 +680,85 @@ def cmd_vendor_bst(a) -> int:
     return 0
 
 
+
+def cmd_setup(a) -> int:
+    """What is configured, what is missing, and the next command to run.
+
+    Written to be run by a person or read aloud by Claude on first use, so
+    every failure line carries its own fix rather than a diagnosis.
+    """
+    from shutil import which
+    ok = "  ok  "
+    bad = " MISS "
+    todo = []
+
+    print("Overleaf review — setup check\n")
+
+    v = sys.version_info
+    good = v >= (3, 9)
+    print(f"[{ok if good else bad}] Python {v.major}.{v.minor}")
+    if not good:
+        todo.append("Python 3.9 or newer is required.")
+
+    for exe, why in (("git", "cloning from Overleaf"),
+                     ("latexmk", "building the PDF")):
+        have = which(exe)
+        print(f"[{ok if have else bad}] {exe}"
+              + (f"  ({have})" if have else f"  — needed for {why}"))
+        if not have:
+            todo.append(
+                f"Install {exe}." + ("" if exe == "git" else
+                " It comes with TeX Live and MacTeX. latexmk rather than bare"
+                " pdflatex matters: a fresh clone has no .bbl, and two pdflatex"
+                " passes exit zero while leaving every citation undefined."))
+
+    stores = [n for n, _g, _s in backends()]
+    holder = cred_where()
+    print(f"[{ok if holder else bad}] Overleaf token"
+          + (f"  (in {holder})" if holder else "  — not stored yet"))
+    print(f"         credential stores available here: {', '.join(stores)}")
+    if not holder:
+        todo.append(
+            "Create a token in Overleaf under Account Settings -> Git "
+            "integration, then run:\n"
+            "    python3 " + str(Path(__file__).resolve()) + " login --token olp_…")
+
+    settings = Path.home() / ".claude" / "settings.json"
+    hooked = False
+    try:
+        hooked = "turn_end.py" in settings.read_text()
+    except OSError:
+        pass
+    print(f"[{ok if hooked else bad}] Stop hook in {settings}")
+    if not hooked:
+        todo.append(
+            "Add the Stop hook to " + str(settings) + ", or the viewer's "
+            "spinner never stops:\n"
+            '    {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": '
+            '"python3 ' + str(HERE / "turn_end.py") + ' 2>/dev/null || true", '
+            '"timeout": 5}]}]}}')
+
+    reg = load_registry()
+    print(f"[{ok if reg else '  --  '}] projects opened: "
+          + (", ".join(sorted(reg)) if reg else "none yet"))
+
+    print()
+    if todo:
+        print("To finish setup:\n")
+        for i, t in enumerate(todo, 1):
+            print(f"{i}. {t}\n")
+        return 1
+    if not reg:
+        print("Setup is complete. Open a paper with its Overleaf editor URL:\n"
+              f"    python3 {Path(__file__).resolve()} open "
+              "https://www.overleaf.com/project/<24-hex-id> --name mypaper\n"
+              "Then run /pdf-review in the directory it prints.")
+    else:
+        print("Setup is complete. Run /pdf-review in a project directory, or "
+              "open another paper with `open <editor-url>`.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -573,7 +779,10 @@ def main() -> int:
     p.add_argument("-m", "--message")
     p.add_argument("--force-assets", action="store_true")
     p.set_defaults(fn=cmd_push)
+    p = sub.add_parser("setup"); p.set_defaults(fn=cmd_setup)
     p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("_askpass"); p.add_argument("prompt", nargs="?", default="")
+    p.set_defaults(fn=cmd_askpass)
     p = sub.add_parser("vendor-bst"); p.add_argument("--dir"); p.set_defaults(fn=cmd_vendor_bst)
 
     a = ap.parse_args()

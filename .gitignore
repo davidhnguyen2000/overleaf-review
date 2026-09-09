@@ -4,7 +4,9 @@ __pycache__/
 .DS_Store
 
 # Runtime state written into the skill directory by overleaf.py.
-# session.json holds an Overleaf session cookie — never commit it.
+# credentials.json holds the Overleaf git token on machines with no system
+# keyring, and session.json holds a session cookie. Never commit either.
 projects.json
 session.json
+credentials.json
 askpass.sh
